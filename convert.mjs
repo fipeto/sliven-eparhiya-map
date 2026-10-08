@@ -9,31 +9,41 @@ const SRC = "D:/Projects/2026_HistoryMap/Exported Files/Exported Files";
 const OUT = "D:/Projects/2026_HistoryMap/webapp/data";
 
 const UTM34N = "+proj=utm +zone=34 +datum=WGS84 +units=m +no_defs";
+const WEBMERC = "+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +no_defs"; // EPSG:3857
 const WGS84 = "+proj=longlat +datum=WGS84 +no_defs";
-const toWgs = (c) => proj4(UTM34N, WGS84, c);
 
-// recursively reproject a GeoJSON coordinate array
-function reproj(coords) {
-  if (typeof coords[0] === "number") return toWgs(coords);
-  return coords.map(reproj);
+const isFinitePair = (c) => Array.isArray(c) && Number.isFinite(c[0]) && Number.isFinite(c[1]);
+
+// recursively reproject a GeoJSON coordinate array with the given source CRS
+function reproj(coords, from) {
+  if (typeof coords[0] === "number") return proj4(from, WGS84, coords);
+  return coords.map((c) => reproj(c, from));
 }
-function reprojFeature(f) {
+function reprojFeature(f, from) {
   if (f.geometry && f.geometry.coordinates)
-    f.geometry.coordinates = reproj(f.geometry.coordinates);
+    f.geometry.coordinates = reproj(f.geometry.coordinates, from);
   return f;
 }
 
-async function readShp(name, { filter } = {}) {
+async function readShp(name, { filter, from = UTM34N } = {}) {
   const shp = join(SRC, name + ".shp");
   const dbf = join(SRC, name + ".dbf");
   const features = [];
+  let skipped = 0;
   const source = await shapefile.open(shp, dbf, { encoding: "utf-8" });
   let r;
   while (!(r = await source.read()).done) {
     const f = r.value;
     if (filter && !filter(f.properties)) continue;
-    features.push(reprojFeature(f));
+    if (!f.geometry || !f.geometry.coordinates) { skipped++; continue; }
+    const g = f.geometry;
+    // drop point features with missing/invalid coords (null geometry in source)
+    if (g.type === "Point" && !isFinitePair(g.coordinates)) { skipped++; continue; }
+    const out = reprojFeature(f, from);
+    if (out.geometry.type === "Point" && !isFinitePair(out.geometry.coordinates)) { skipped++; continue; }
+    features.push(out);
   }
+  if (skipped) console.log(`  [${name}] skipped ${skipped} feature(s) with invalid geometry`);
   return { type: "FeatureCollection", features };
 }
 
@@ -49,14 +59,56 @@ function bbox(fc) {
   return [xmin, ymin, xmax, ymax];
 }
 
-const eparhiya = await readShp("Sliven_Eparhiya");
+// Територия, клипната по държавната граница на България (следва брега/границата)
+const eparhiya = await readShp("Sliven_Eparhiya_boundaries");
 const monasteries = await readShp("manastiri_eparhii", {
   filter: (p) => (p.Eparhiya || "").trim() === "Сливен",
 });
 
+// Църкви: BG_Eparhii_Settlements, филтър по епархия; чисти имена на полета за попъп
+const churchesRaw = await readShp("BG_Eparhii_Settlements", {
+  from: WEBMERC,
+  filter: (p) => (p.FIELD_NAME || "").trim() === "Сливенска епархия",
+});
+// отхвърли точки извън разумния обхват на България (null/невалидна геометрия в източника)
+const inBG = (f) => {
+  const [x, y] = f.geometry.coordinates;
+  return x >= 22 && x <= 29 && y >= 41 && y <= 44.5;
+};
+const validChurch = churchesRaw.features.filter(inBG);
+console.log(`  [churches] kept ${validChurch.length}/${churchesRaw.features.length} within BG bbox`);
+
+const churches = {
+  type: "FeatureCollection",
+  features: validChurch.map((f) => {
+    const p = f.properties;
+    return {
+      type: "Feature",
+      geometry: f.geometry,
+      properties: {
+        selo: (p.FIELD_NA_2 || "").trim(),        // населено място
+        namestnichestvo: (p.FIELD_NA_1 || "").trim(), // наместничество
+        obshtina: (p.FIELD_NA_4 || "").trim(),    // община
+        oblast: (p.FIELD_NA_3 || "").trim(),      // област
+        adres: (p.FIELD_NA_5 || "").trim(),       // пълен адрес
+        tip: (p.FIELD_NA_6 || "").trim(),         // село/град/център
+      },
+    };
+  }),
+};
+
 writeFileSync(join(OUT, "eparhiya.geojson"), JSON.stringify(eparhiya));
 writeFileSync(join(OUT, "monasteries.geojson"), JSON.stringify(monasteries));
+writeFileSync(join(OUT, "churches.geojson"), JSON.stringify(churches));
+
+// data.js — вгражда се в index.html чрез <script src> (работи и при двоен клик, за разлика от fetch)
+const dataJs =
+  "window.EPARHIYA=" + JSON.stringify(eparhiya) + ";\n" +
+  "window.MONASTERIES=" + JSON.stringify(monasteries) + ";\n" +
+  "window.CHURCHES=" + JSON.stringify(churches) + ";\n";
+writeFileSync("D:/Projects/2026_HistoryMap/webapp/data.js", dataJs);
 
 console.log("eparhiya  features:", eparhiya.features.length, "bbox:", bbox(eparhiya).map((n) => n.toFixed(4)).join(", "));
 console.log("monasteries features:", monasteries.features.length, "bbox:", bbox(monasteries).map((n) => n.toFixed(4)).join(", "));
-console.log("monastery names:", monasteries.features.map((f) => f.properties.Name).join(", "));
+console.log("churches  features:", churches.features.length, "bbox:", bbox(churches).map((n) => n.toFixed(4)).join(", "));
+console.log("church sample:", JSON.stringify(churches.features.slice(0,3).map(f=>f.properties), null, 0));
