@@ -14,6 +14,27 @@ const WGS84 = "+proj=longlat +datum=WGS84 +no_defs";
 
 const isFinitePair = (c) => Array.isArray(c) && Number.isFinite(c[0]) && Number.isFinite(c[1]);
 
+// ---- point-in-polygon (ray casting), handи MultiPolygon + holes ----
+function inRing(pt, ring) {
+  const [x, y] = pt; let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const xi = ring[i][0], yi = ring[i][1], xj = ring[j][0], yj = ring[j][1];
+    if (((yi > y) !== (yj > y)) && (x < ((xj - xi) * (y - yi)) / (yj - yi) + xi)) inside = !inside;
+  }
+  return inside;
+}
+function pointInGeom(pt, geom) {
+  const parts = geom.type === "MultiPolygon" ? geom.coordinates : [geom.coordinates];
+  for (const poly of parts) {
+    if (inRing(pt, poly[0])) {
+      let inHole = false;
+      for (let k = 1; k < poly.length; k++) if (inRing(pt, poly[k])) { inHole = true; break; }
+      if (!inHole) return true;
+    }
+  }
+  return false;
+}
+
 // recursively reproject a GeoJSON coordinate array with the given source CRS
 function reproj(coords, from) {
   if (typeof coords[0] === "number") return proj4(from, WGS84, coords);
@@ -75,8 +96,11 @@ const inBG = (f) => {
   const [x, y] = f.geometry.coordinates;
   return x >= 22 && x <= 29 && y >= 41 && y <= 44.5;
 };
-const validChurch = churchesRaw.features.filter(inBG);
-console.log(`  [churches] kept ${validChurch.length}/${churchesRaw.features.length} within BG bbox`);
+const epGeom = eparhiya.features[0].geometry;
+const validChurch = churchesRaw.features
+  .filter(inBG)
+  .filter((f) => pointInGeom(f.geometry.coordinates, epGeom)); // клип по границата на епархията (маха напр. гр. Твърдица)
+console.log(`  [churches] kept ${validChurch.length}/${churchesRaw.features.length} inside eparchy boundary`);
 
 const churches = {
   type: "FeatureCollection",
